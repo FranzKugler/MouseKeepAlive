@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MouseKeepAlive Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,system-ui,sans-serif;background:#f2f2f7;color:#1c1c1e;display:flex;justify-content:center;padding:40px 16px}
+.card{background:#fff;border-radius:12px;padding:24px;max-width:380px;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h1{font-size:20px;text-align:center;margin-bottom:4px}
+.sub{text-align:center;font-size:13px;color:#8e8e93;margin-bottom:20px}
+h2{font-size:14px;font-weight:700;color:#8e8e93;text-transform:uppercase;letter-spacing:.5px;margin-top:24px;margin-bottom:8px}
+label{display:block;font-size:14px;font-weight:600;margin-bottom:4px;margin-top:12px}
+input{width:100%;padding:10px 12px;border:1px solid #c7c7cc;border-radius:8px;font-size:16px}
+input:focus{outline:none;border-color:#007aff}
+.row{display:flex;gap:8px}
+.row input{flex:1}
+button{width:100%;padding:12px;margin-top:24px;background:#007aff;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer}
+button:active{background:#0056b3}
+button:disabled{background:#999}
+.msg{text-align:center;margin-top:12px;font-size:14px}
+.ok{color:#34c759}.err{color:#ff3b30}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>MouseKeepAlive</h1>
+<div class="sub">Initial Setup</div>
+
+<h2>WiFi Network</h2>
+<form id="f">
+<label for="ssid">Network Name (SSID)</label>
+<input id="ssid" name="ssid" required autocomplete="off" placeholder="SSID">
+<label for="password">Password</label>
+<input id="password" name="password" type="password" placeholder="Password (leave blank if open)">
+
+<h2>Wiggle Settings</h2>
+<label for="wiggle_interval">Interval (seconds, 10–3600)</label>
+<input id="wiggle_interval" name="wiggle_interval" type="number" min="10" max="3600" value="300">
+<label for="wiggle_amplitude">Amplitude (pixels, 1–50)</label>
+<input id="wiggle_amplitude" name="wiggle_amplitude" type="number" min="1" max="50" value="5">
+
+<h2>Log Settings (optional)</h2>
+<label>UDP Log Target</label>
+<div class="row">
+<input id="udp_host" name="udp_host" placeholder="Host IP" autocomplete="off">
+<input id="udp_port" name="udp_port" type="number" value="5555" style="max-width:90px">
+</div>
+
+<button type="submit" id="btn">Save &amp; Connect</button>
+</form>
+<div class="msg" id="msg"></div>
+</div>
+<script>
+document.getElementById('f').onsubmit=async function(e){
+  e.preventDefault();
+  const btn=document.getElementById('btn'),msg=document.getElementById('msg');
+  btn.disabled=true;btn.textContent='Saving...';msg.textContent='';
+  const body={
+    ssid:document.getElementById('ssid').value,
+    password:document.getElementById('password').value,
+    wiggle_interval:parseInt(document.getElementById('wiggle_interval').value)||300,
+    wiggle_amplitude:parseInt(document.getElementById('wiggle_amplitude').value)||5,
+    udp_host:document.getElementById('udp_host').value,
+    udp_port:parseInt(document.getElementById('udp_port').value)||5555
+  };
+  try{
+    const r=await fetch('/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(r.ok){msg.className='msg ok';msg.textContent='Saved! Device is rebooting...';}
+    else{throw new Error(d.message||'Failed');}
+  }catch(err){msg.className='msg err';msg.textContent=err.message;btn.disabled=false;btn.textContent='Save & Connect';}
+};
+</script>
+</body>
+</html>

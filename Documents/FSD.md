@@ -427,67 +427,213 @@ BLE bond data is stored by NimBLE in its own NVS namespace (`ble_bond`).
 
 ## 7. Operational Procedures
 
-### 7.1 Initial Deployment (First Flash)
+### 7.1 Hardware Setup
 
-1. Install ESP-IDF ≥ 5.2 on macOS per the ESP-IDF Getting Started guide.
-2. Clone the repository: `git clone https://github.com/FranzKugler/MouseKeepAlive`
-3. Configure the project: `idf.py menuconfig` — verify target is `esp32s3`, flash size is 16 MB.
-4. Build: `idf.py build`
-5. Connect the XIAO ESP32-S3 Plus via USB-C (enter download mode by holding BOOT while pressing RESET).
-6. Flash: `idf.py -p <PORT> flash` — or use the workbench RFC2217 flash command.
-7. Monitor: `idf.py -p <PORT> monitor` — verify boot log and AP mode advertisement.
+| What | Where |
+|------|-------|
+| ESP32-S3 USB | Workbench SLOT1 — `/dev/ttyACM0` |
+| RFC2217 serial | `rfc2217://workbench.local:4001` |
+| GPIO BOOT | GPIO 18 (workbench control) |
+| GPIO EN (reset) | GPIO 17 (workbench control) |
+| Workbench host | `workbench.local:8080` (172.22.50.10) |
+| UDP log sink | `workbench.local:5555` |
+| OTA firmware URL | `http://workbench.local:8080/api/firmware/MouseKeepAlive/MouseKeepAlive.bin` |
 
-### 7.2 Provisioning (First Boot)
+#### Project-Specific Values
 
-1. On first boot, the device starts AP mode: SSID `MouseKeepAlive-XXXX`.
-2. Connect a phone or laptop to the AP (open, no password).
-3. A captive portal page opens automatically (or navigate to `http://192.168.4.1`).
-4. Select your WiFi network and enter the password.
-5. Configure wiggle interval and amplitude on the App Config page.
-6. Tap **Save & Reboot** — the device restarts in STA mode and connects to WiFi.
-7. Verify: `GET http://<device-ip>/status` returns `ble_connections: 0` and WiFi RSSI.
+| Value | Setting |
+|-------|---------|
+| WiFi portal SSID | `MouseKeepAlive-XXXX` (last 4 hex digits of SoftAP MAC) |
+| Workbench AP SSID | `WB-TestAP` |
+| Workbench AP password | `wbtestpass` |
+| BLE device name | `MouseKeepAlive` |
+| NVS namespace | `mka_config` |
+| NUS RX characteristic | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
 
-### 7.3 Pairing BLE HID Mouse with Windows
+---
 
-1. On the Windows machine, open **Settings → Bluetooth → Add Device → Bluetooth**.
-2. The device appears as `MouseKeepAlive` — click to pair.
-3. No PIN required (no-input-output pairing).
-4. Windows installs the HID driver automatically and the device appears under **Mice and other pointing devices**.
-5. Repeat for the second Windows machine.
-6. After pairing, verify that mouse wiggles appear in Windows mouse pointer movement at the configured interval.
+### 7.2 Flashing (Initial or Recovery)
 
-### 7.4 OTA Firmware Update
+The device uses RFC2217 remote serial for flashing. From the project root after `idf.py build`:
 
 ```bash
-# Upload new firmware to workbench
-curl -X POST http://workbench.local:8080/api/firmware/upload \
-  -F "project=MouseKeepAlive" -F "file=@build/MouseKeepAlive.bin"
-
-# Trigger OTA on device
-curl -X POST http://<device-ip>/ota/trigger \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "http://workbench.local:8080/api/firmware/MouseKeepAlive/latest"}'
+# Flash all partitions via workbench RFC2217
+source ~/esp/esp-idf/export.sh
+python -m esptool --chip esp32s3 -b 460800 \
+  --before default_reset --after hard_reset \
+  --port rfc2217://workbench.local:4001 \
+  write_flash "@build/flash_args"
 ```
 
-Monitor progress via UDP logs: `curl "http://workbench.local:8080/api/udplog?limit=50"`
+Or use the `esp-idf-handling` skill — it handles download mode (GPIO BOOT=18, EN=17) and flashing via the workbench.
 
-### 7.5 Factory Reset
+---
 
-**Via button**: Hold BOOT button for 5 seconds. LED (if available) blinks rapidly.  
-**Via HTTP**: `POST http://<device-ip>/config/reset`  
-**Via workbench NVS erase**: `esptool.py --port <PORT> erase_region 0x9000 0x6000`
+### 7.3 WiFi Provisioning
 
-After factory reset the device erases all configuration and bond data, then reboots into captive portal AP mode.
+WiFi provisioning is required before OTA, UDP logs, or HTTP endpoints are usable. Do this once after the initial flash.
 
-### 7.6 Recovery Procedures
+**Phase 1 — Ensure device is in AP mode.**
 
-| Scenario | Recovery |
-|----------|---------|
-| Device cannot connect to WiFi | Hold BOOT 5 s → captive portal → re-provision |
-| WiFi password changed at router | Same as above — fallback to AP mode after repeated auth failures |
-| OTA bricked firmware | A/B scheme automatically rolls back to previous firmware |
-| All OTA partitions corrupt | Re-flash factory partition via USB with `idf.py flash` |
-| BLE bonds stale (Windows re-paired) | Factory reset or `POST /config/reset` to clear bond store |
+If freshly flashed, the device boots straight into AP mode (no NVS credentials). If previously provisioned, trigger a WiFi reset first:
+
+```bash
+# BLE WiFi reset — connect to device's NUS and send CMD_WIFI_RESET
+curl -s -X POST http://workbench.local:8080/api/ble/scan \
+  -H 'Content-Type: application/json' -d '{"timeout": 5}' | jq .
+
+curl -s -X POST http://workbench.local:8080/api/ble/connect \
+  -H 'Content-Type: application/json' -d '{"name": "MouseKeepAlive"}'
+
+curl -s -X POST http://workbench.local:8080/api/ble/write \
+  -H 'Content-Type: application/json' \
+  -d '{"characteristic": "6e400002-b5a3-f393-e0a9-e50e24dcca9e", "data": "20"}'
+```
+
+Confirm via serial monitor: `"WiFi reset requested"` → `"WiFi credentials erased"` → reboot → `"No WiFi credentials"` → `"AP mode: SSID='MouseKeepAlive-XXXX'"`.
+
+**Phase 2 — Provision via captive portal.**
+
+```bash
+curl -s -X POST http://workbench.local:8080/api/enter-portal \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "portal_ssid": "MouseKeepAlive-XXXX",
+    "ssid":        "WB-TestAP",
+    "password":    "wbtestpass"
+  }'
+```
+
+Expected serial events: `"Portal page requested"` → `"Credentials saved"` → reboot → `"STA mode, connecting to 'WB-TestAP'"` → `"STA got IP"`.
+
+**Troubleshooting provisioning:**
+
+- `enter-portal` times out → confirm device logged `"AP mode: SSID='...'"` before calling enter-portal
+- `"STA disconnect, retry"` loops → check workbench AP is up; verify SSID/password values
+- Portal page not served → check serial for any HTTP server error after AP start
+
+---
+
+### 7.4 BLE Commands
+
+The workbench connects to the device's NUS (Nordic UART Service) to send control commands.
+
+```bash
+# Scan for device
+curl -s -X POST http://workbench.local:8080/api/ble/scan \
+  -H 'Content-Type: application/json' -d '{"timeout": 5}'
+
+# Connect
+curl -s -X POST http://workbench.local:8080/api/ble/connect \
+  -H 'Content-Type: application/json' -d '{"name": "MouseKeepAlive"}'
+
+# Send command (hex bytes written to NUS RX characteristic)
+curl -s -X POST http://workbench.local:8080/api/ble/write \
+  -H 'Content-Type: application/json' \
+  -d '{"characteristic": "6e400002-b5a3-f393-e0a9-e50e24dcca9e", "data": "<hex>"}'
+
+# Disconnect
+curl -s -X POST http://workbench.local:8080/api/ble/disconnect
+```
+
+#### BLE Command Reference
+
+| Opcode | Hex example | Description | Expected log |
+|--------|-------------|-------------|--------------|
+| `0x10` | `10` | Trigger OTA (default URL) | `"OTA update requested"` |
+| `0x10 <url>` | `10687474703a2f2f...` | Trigger OTA with custom URL | `"OTA update requested"` |
+| `0x20` | `20` | WiFi reset (erase creds + reboot) | `"WiFi reset requested"` → `"WiFi credentials erased"` |
+
+---
+
+### 7.5 OTA Firmware Update
+
+```bash
+# Step 1: Build new firmware
+source ~/esp/esp-idf/export.sh && idf.py build
+
+# Step 2: Upload binary to workbench
+curl -s -X POST http://workbench.local:8080/api/firmware/upload \
+  -F "project=MouseKeepAlive" \
+  -F "file=@build/MouseKeepAlive.bin"
+
+# Step 3a: Trigger OTA via HTTP relay (preferred — device must have WiFi IP)
+curl -s -X POST http://workbench.local:8080/api/wifi/http \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "method": "POST",
+    "path": "/ota/trigger",
+    "body": {"url": "http://workbench.local:8080/api/firmware/MouseKeepAlive/MouseKeepAlive.bin"}
+  }'
+
+# Step 3b: Trigger OTA via BLE (alternative — works even before WiFi is stable)
+curl -s -X POST http://workbench.local:8080/api/ble/write \
+  -H 'Content-Type: application/json' \
+  -d '{"characteristic": "6e400002-b5a3-f393-e0a9-e50e24dcca9e", "data": "10"}'
+```
+
+Monitor OTA via UDP logs until `"OTA succeeded"` or `"OTA failed"`:
+
+```bash
+curl -s "http://workbench.local:8080/api/udplog?limit=50" | jq .
+```
+
+---
+
+### 7.6 HTTP Endpoints
+
+All endpoints are available at `http://<device-ip>/` once the device has a WiFi IP. Use the workbench HTTP relay to reach the device without knowing its IP:
+
+```bash
+# HTTP relay syntax
+curl -s -X POST http://workbench.local:8080/api/wifi/http \
+  -H 'Content-Type: application/json' \
+  -d '{"method": "GET", "path": "/status"}'
+```
+
+| Method | Endpoint | Description |
+|--------|---------|-------------|
+| GET | `/status` | JSON: firmware version, uptime, WiFi RSSI, BLE connection, wiggle config |
+| POST | `/config` | Update `wiggle_interval_s`, `wiggle_amplitude`, `udp_log_host`, `udp_log_port` |
+| POST | `/ota/trigger` | Start OTA download. Body: `{"url": "http://..."}` |
+| POST | `/config/reset` | Factory reset (erases NVS, reboots into AP mode) |
+
+---
+
+### 7.7 Log Monitoring
+
+**Serial monitor** (boot events, crashes):
+
+```bash
+curl -s -X POST http://workbench.local:8080/api/serial/monitor \
+  -H 'Content-Type: application/json' \
+  -d '{"slot": "SLOT1", "pattern": "Init complete", "timeout": 30}'
+```
+
+**UDP logs** (live operation after WiFi is up):
+
+```bash
+curl -s "http://workbench.local:8080/api/udplog?limit=100" | jq .
+```
+
+---
+
+### 7.8 Factory Reset
+
+**Via BOOT button**: Hold GPIO0 (physical BOOT button) for 5 seconds. Device erases NVS and reboots into AP mode.
+
+**Via HTTP**:
+```bash
+curl -s -X POST http://workbench.local:8080/api/wifi/http \
+  -H 'Content-Type: application/json' \
+  -d '{"method": "POST", "path": "/config/reset"}'
+```
+
+**Via workbench NVS erase** (recovery when device is unresponsive):
+```bash
+curl -s -X POST http://workbench.local:8080/api/serial/nvs-erase \
+  -H 'Content-Type: application/json' -d '{"slot": "SLOT1"}'
+```
 
 ---
 
@@ -495,51 +641,53 @@ After factory reset the device erases all configuration and bond data, then rebo
 
 ### 8.1 Phase 1 Verification
 
-| Test ID | Feature | Procedure | Success Criteria |
-|---------|---------|-----------|-----------------|
-| TC-CP-100 | Captive portal first boot | Power on with empty NVS; connect to AP; configure WiFi | Device connects to WiFi, config persists |
-| TC-CP-101 | Captive portal via button | Hold BOOT 5 s; connect; update WiFi | New credentials saved, device reconnects |
-| TC-CP-102 | Portal network scan | Open WiFi page in portal | Available SSIDs listed with RSSI |
-| WIFI-001 | WiFi STA connection | Provision with valid credentials | Device connects, IP assigned |
-| WIFI-003 | Auto-reconnect | Disconnect WiFi AP; restore | Reconnects without reboot |
-| TC-NVS-100 | Config persistence | Set wiggle config; reboot | Values identical after reboot |
-| TC-NVS-101 | First boot defaults | Erase NVS; boot | Default values used, AP mode active |
-| TC-NVS-102 | Factory reset (button) | Hold BOOT 5 s | NVS cleared, AP mode |
-| TC-NVS-103 | Factory reset (HTTP) | `POST /config/reset` | NVS cleared, AP mode |
-| TC-OTA-100 | Successful OTA update | Flash v1; upload v2; trigger OTA | v2 running after reboot |
-| TC-OTA-101 | OTA rollback | Flash broken firmware via OTA | Device rolls back to v1 |
-| TC-OTA-102 | OTA version reporting | `GET /status` before and after OTA | Version string matches firmware |
-| TC-LOG-100 | Serial boot log | Monitor serial at boot | Version, reset reason, WiFi events logged |
-| TC-LOG-101 | UDP log delivery | Configure UDP target; boot | Boot messages received at workbench |
-| EC-OTA-200 | Network loss during OTA | Kill WiFi at 50% | No brick; retry succeeds |
-| EC-OTA-202 | Invalid firmware rejection | Upload random binary via OTA | Rejected; device unaffected |
-| EC-NVS-200 | NVS corruption recovery | Corrupt NVS via esptool; boot | Falls back to defaults; AP mode |
+| Step | Feature | Test procedure | Success criteria |
+|------|---------|---------------|-----------------|
+| 1 | Serial boot log | Flash firmware; monitor serial (see §7.7) | Logs contain: firmware version, `"NVS initialized"`, `"Init complete"` |
+| 2 | UDP log delivery | After provisioning, reboot; poll `GET /api/udplog` | Boot log messages appear in workbench UDP sink |
+| 3 | AP mode first boot | NVS erase (§7.8); reboot; check serial | `"No WiFi credentials"` → `"AP mode: SSID='MouseKeepAlive-XXXX'"` within 10 s |
+| 4 | Captive portal served | Issue enter-portal Phase 1 only; GET `/` via workbench HTTP relay to `192.168.4.1` | Serial: `"Portal page requested"`; HTTP 200 with HTML body |
+| 5 | WiFi provisioning | Full provisioning sequence (see §7.3) | Serial: `"Credentials saved"` → `"STA got IP"`; `GET /status` returns `wifi_connected: true` |
+| 6 | NVS config persistence | POST `/config` with `wiggle_interval_s: 60`; reboot; GET `/status` | `wiggle_interval_s` is `60` after reboot |
+| 7 | Factory reset (button) | Hold GPIO BOOT 5 s via workbench GPIO; monitor serial | `"No WiFi credentials"` → `"AP mode"` logged; `/status` unavailable until re-provisioned |
+| 8 | Factory reset (HTTP) | Provision; POST `/config/reset` via HTTP relay | Same as step 7 |
+| 9 | OTA v1 → v2 | Build v2 (bump version string); upload to workbench; trigger via HTTP relay (§7.5) | Serial: `"OTA succeeded"`; reboot; `GET /status` returns new version string |
+| 10 | OTA rollback | Build intentionally broken firmware (omit `esp_ota_mark_app_valid`); OTA it | Device reboots twice; second boot logs previous version; broken version absent from `/status` |
+| 11 | BLE NUS advertising | After boot; BLE scan from workbench | Device name `MouseKeepAlive` appears in scan results |
+| 12 | BLE CMD_WIFI_RESET | Connect BLE; write `0x20` to NUS RX | `"WiFi reset requested"` → `"WiFi credentials erased"` in serial/UDP |
+| 13 | BLE CMD_OTA | Provision; connect BLE; write `0x10` to NUS RX | `"OTA update requested"` in serial; OTA task starts |
+| 14 | Heartbeat | Leave device running 60 s; check UDP logs | `"alive N"` log line appears every ~10 s |
+| 15 | WiFi auto-reconnect | Disable workbench AP for 30 s; re-enable | `"STA disconnect, retry"` logged; `"STA got IP"` logged on reconnect |
+
+---
 
 ### 8.2 Phase 2 Verification
 
-| Test ID | Feature | Procedure | Success Criteria |
-|---------|---------|-----------|-----------------|
-| TC-BLE-100 | BLE discovery & connection | Scan from Windows; pair | Device visible; connection established |
-| HID-PAIR-01 | Windows HID pairing | Pair via Windows Bluetooth settings | Appears as mouse in Device Manager |
-| HID-WIGGLE-01 | Wiggle delivery | Wait for interval; watch mouse pointer | Pointer moves by amplitude and returns |
-| HID-WIGGLE-02 | Dual-host wiggle | Two Windows PCs paired; wait interval | Both PCs receive wiggle simultaneously |
-| HID-INTERVAL-01 | Interval config | Set interval to 30 s via HTTP; observe | Wiggle fires every 30 s ± 500 ms |
-| HID-AMPLITUDE-01 | Amplitude config | Set amplitude to 10; observe | Pointer moves 10 px each direction |
-| TC-BLE-100 | Advertising resume | Disconnect one host; wait | Device re-advertises within 1 s |
-| EC-BLE-204 | Bond persistence | Pair; reboot; reconnect | No re-pairing needed |
-| EC-BLE-203 | BLE + WiFi coexistence | Run OTA while BLE connected and wiggling | Both complete; no crash |
-| TC-OTA-100 (P2) | OTA with active BLE | Trigger OTA while 2 BLE hosts connected | Wiggle continues during download; reconnects after reboot |
-| EC-BLE-200 | Disconnect during operation | Force-disconnect one host | Device recovers, resumes advertising |
-| EC-BLE-201 | Rapid connect/disconnect | 20 rapid cycles | No memory leak; device stable |
+| Step | Feature | Test procedure | Success criteria |
+|------|---------|---------------|-----------------|
+| 1 | BLE HID advertising | Boot Phase 2 firmware; workbench BLE scan | Device name `MouseKeepAlive` with appearance 0x03C2 in scan |
+| 2 | Windows HID pairing (PC1) | Pair `MouseKeepAlive` via Windows Bluetooth settings | Device Manager shows "MouseKeepAlive" under Mice and other pointing devices |
+| 3 | Windows HID pairing (PC2) | Repeat on second PC while PC1 is connected | Both connections shown in `GET /status` as `ble_connections: 2` |
+| 4 | Wiggle delivery — PC1 | Set interval to 30 s via POST `/config`; wait 35 s | Pointer on PC1 moves and returns; `wiggle_interval_s` in `/status` is `30` |
+| 5 | Wiggle delivery — PC2 | Same 30 s interval; observe both PCs | Both pointers move simultaneously |
+| 6 | Wiggle return symmetry | Set amplitude to 5; observe cursor position before and after wiggle | Net cursor displacement is zero after `[+5,+5]` → 100 ms → `[-5,-5]` |
+| 7 | Bond persistence | Reboot device; wait 15 s | Both Windows PCs reconnect without re-pairing; `ble_connections: 2` |
+| 8 | Advertising resume | Force-disconnect PC1 (disable Bluetooth); wait 2 s; re-enable | Serial: disconnect logged; re-advertise logged; PC1 reconnects |
+| 9 | Interval live config | POST `/config` `wiggle_interval_s: 300`; observe | Next wiggle fires ~300 s later; no reboot required |
+| 10 | OTA while BLE active | 2 PCs connected; trigger OTA via HTTP relay (§7.5) | Wiggle fires at least once during download; both PCs reconnect after reboot (EC-BLE-203) |
+
+---
 
 ### 8.3 Acceptance Tests
 
-| Test | Scenario | Success Criteria |
+| Test | Scenario | Success criteria |
 |------|---------|-----------------|
-| AT-01 | 24-hour continuous operation | Device runs uninterrupted for 24 h with 2 Windows hosts paired | No crash, no missed wiggles (log review), heap stable |
-| AT-02 | Windows lock-screen prevention | Configure 5-min interval on PC with 2-min lock timeout | PC never locks during 1-hour observation |
-| AT-03 | Full OTA cycle end-to-end | Provision → pair 2 PCs → OTA update → verify both PCs reconnect | All steps succeed without manual BLE re-pairing |
-| AT-04 | Power loss recovery | Unplug device mid-operation; replug | Reconnects to both Windows hosts within 60 s |
+| AT-01 | 24-hour soak | Device runs with 2 PCs paired; UDP logs collected | No crash; `"alive N"` continuous; heap in `/status` stable (>30 KB) |
+| AT-02 | Lock-screen prevention | 5-min wiggle interval; PC lock timeout 2 min | PC never locks during 1 h observation |
+| AT-03 | Full end-to-end OTA | Provision → pair 2 PCs → OTA → both PCs reconnect | All steps succeed; no manual re-pairing |
+| AT-04 | Power-loss recovery | Unplug mid-operation; replug | `"STA got IP"` + `ble_connections: 2` within 60 s |
+
+---
 
 ### 8.4 Traceability Matrix
 
@@ -597,90 +745,106 @@ After factory reset the device erases all configuration and bond data, then rebo
 
 ## 9. Troubleshooting Guide
 
-| Symptom | Likely Cause | Diagnostic Steps | Corrective Action |
-|---------|-------------|-----------------|-------------------|
-| Device not visible in Windows Bluetooth scan | Not advertising, or BLE stack not started | Check UDP/serial log for `BLE advertising started` | Verify BLE init in boot log; power-cycle device |
-| Windows pairs but no mouse movement | HID report not reaching Windows | Check log for wiggle timer ticks and `hid_report_sent` entries | Verify HOGP HID service UUID and report descriptor |
-| Wiggle causes cursor to drift | Return report not sent or wrong sign | Check wiggle sequence in logs | Verify ±delta symmetry in `wiggle_scheduler.c` |
-| Second Windows PC cannot pair | `MAX_CONNECTIONS=1` or connection slot full | Check log for `BLE max connections reached` | Confirm `CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2` in sdkconfig |
-| BLE disconnects shortly after pairing | Windows power management suspending BLE HID | Check Event Viewer on Windows | Set device power management to "Allow this device to wake the computer" |
-| OTA download starts but never completes | WiFi drops or server unreachable | Check UDP log for `OTA error` | Verify workbench is reachable; retry `POST /ota/trigger` |
-| Device boots into AP mode unexpectedly | WiFi credentials missing or corrupt | Serial log shows `NVS key not found: wifi_ssid` | Re-provision via captive portal |
-| Heap keeps shrinking | Memory leak in BLE or OTA path | Monitor `free_heap` in `/status` and logs | Run EC-BLE-201 to isolate; check for unfreed buffers |
-| Crash / panic on boot after OTA | New firmware defective | Serial log: panic backtrace visible | A/B rollback should fire automatically; if not, re-flash via USB |
+### Logging Strategy
+
+| Situation | Method | Why |
+|-----------|--------|-----|
+| Verify boot sequence | Serial monitor (`GET /api/serial/monitor`) | Captures UART output before WiFi is up |
+| Monitor BLE commands | UDP logs (`GET /api/udplog`) | Non-blocking; works while device runs normally |
+| Diagnose OTA failure | Serial monitor | Captures `"OTA failed"` + error code before any reboot |
+| Capture crash/panic | Serial monitor | Only UART captures panic handler backtrace |
+| Confirm provisioning | Serial monitor | WiFi/portal events fire before UDP log is active |
+
+### Troubleshooting
+
+| Test failure | Diagnostic | Fix |
+|-------------|-----------|-----|
+| Serial monitor shows no output | `GET /api/devices` → check SLOT1 present, not flapping | Re-flash; check USB connection |
+| `enter-portal` times out | Serial: confirm `"AP mode: SSID='...'"` logged | Issue BLE CMD_WIFI_RESET first; check SSID value matches |
+| `"STA disconnect, retry"` loops on provisioning | Wrong SSID/password sent to portal | Re-run provisioning with correct workbench AP credentials |
+| UDP logs empty after provisioning | `"UDP logging -> ..."` missing from serial boot log | Check NVS has correct `udp_host` value; re-provision with correct host |
+| BLE scan returns empty list | Device not advertising | Serial: check `"BLE NUS initialized"` logged; check `CONFIG_BT_ENABLED=y` |
+| OTA task starts but `"OTA failed"` logged | Workbench not reachable or binary not uploaded | Verify `GET /api/firmware/list`; check URL in trigger request |
+| Device does not roll back after bad OTA | `esp_ota_mark_app_valid` called despite boot failure | Remove or gate the call on application health check |
+| `/status` returns 404 | HTTP server not started (WiFi not up yet) | Wait for `"STA got IP"` in logs; HTTP server starts on that event |
+| BLE not visible in Phase 2 Windows scan | Phase 2 HID advertising not started | Confirm HOGP service added before `nimble_port_freertos_init` |
+| Windows pairs but shows no mouse movement | HID report descriptor mismatch or no report sent | Verify descriptor bytes; check wiggle scheduler is firing |
+| Second PC cannot pair simultaneously | `CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2` not set | Run `idf.py menuconfig` or check `sdkconfig.defaults` |
 
 ---
 
 ## 10. Appendix
 
-### 10.1 Configuration Defaults
+### 10.1 Required Log Patterns (Workbench Contract)
 
-| Parameter | Default | Min | Max | Unit |
-|-----------|---------|-----|-----|------|
-| `wiggle_interval` | 300 | 10 | 3600 | seconds |
-| `wiggle_amplitude` | 5 | 1 | 50 | pixels |
-| `udp_log_port` | 5555 | — | — | — |
-| AP mode timeout | 300 | — | — | seconds |
-| OTA rollback window | 30 | — | — | seconds |
-| BOOT button hold (factory reset) | 5 | — | — | seconds |
+The workbench skills grep for these exact strings. They must not be reformatted.
 
-### 10.2 BLE UUIDs
+| Pattern | Source file | When emitted |
+|---------|------------|-------------|
+| `"Init complete"` | `app_main.c` | End of `app_main()` |
+| `"alive %lu"` | `app_main.c` | Every 10 s in `alive_task` |
+| `"OTA succeeded"` | `ota_update.c` | OTA download complete |
+| `"OTA failed"` | `ota_update.c` | OTA download error |
+| `"OTA update requested"` | `cmd_handler.c` | BLE `CMD_OTA` received |
+| `"WiFi reset requested"` | `cmd_handler.c` / `wifi_prov.c` | BLE `CMD_WIFI_RESET` / HTTP reset |
+| `"WiFi credentials erased"` | `nvs_store.c` | After `nvs_store_erase_wifi()` |
+| `"UDP logging -> %s:%d"` | `udp_log.c` | `udp_log_init()` called |
+| `"No WiFi credentials"` | `wifi_prov.c` | No stored credentials found |
+| `"AP mode: SSID='%s'"` | `wifi_prov.c` | SoftAP started |
+| `"Portal page requested"` | `wifi_prov.c` | Portal GET handler called |
+| `"Credentials saved"` | `wifi_prov.c` | Portal POST handler — creds saved |
+| `"STA mode, connecting to '%s'"` | `wifi_prov.c` | `start_sta()` called |
+| `"STA got IP"` | `wifi_prov.c` | `IP_EVENT_STA_GOT_IP` received |
+| `"STA disconnect, retry"` | `wifi_prov.c` | `WIFI_EVENT_STA_DISCONNECTED` |
+| `"BLE NUS initialized"` | `ble_nus.c` | `ble_nus_init()` complete |
 
-| Service / Characteristic | UUID |
-|--------------------------|------|
-| HID Service | 0x1812 |
-| HID Information | 0x2A4A |
-| Report Map | 0x2A4B |
-| HID Control Point | 0x2A4C |
-| HID Report (Input) | 0x2A4D |
-| Battery Service | 0x180F |
-| Battery Level | 0x2A19 |
-| Device Information | 0x180A |
-| Firmware Revision | 0x2A26 |
+### 10.2 NVS Schema (`mka_config` namespace)
 
-### 10.3 HTTP Endpoint Quick Reference
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `wifi_ssid` | String | — | WiFi network SSID |
+| `wifi_pass` | String | — | WiFi password |
+| `wiggle_int` | UInt32 | 300 | Wiggle interval (seconds) |
+| `wiggle_amp` | UInt8 | 5 | Wiggle amplitude (pixels) |
+| `udp_host` | String | — | UDP log target host/IP |
+| `udp_port` | UInt16 | 5555 | UDP log target port |
 
-```
-GET  /status          → JSON system status
-POST /config          → Update wiggle config (JSON body)
-POST /ota/trigger     → Start OTA download (JSON body: {"url": "..."})
-POST /config/reset    → Factory reset
-```
+Boot count is stored separately in NVS namespace `mka_sys`, key `boot_count`.
 
-### 10.4 Workbench Commands (Quick Reference)
+### 10.3 Partition Table (16 MB Flash)
 
-```bash
-# Upload firmware
-curl -X POST http://workbench.local:8080/api/firmware/upload \
-  -F "project=MouseKeepAlive" -F "file=@build/MouseKeepAlive.bin"
+| Partition | Type | Offset | Size |
+|-----------|------|--------|------|
+| nvs | data/nvs | 0x9000 | 24 KB |
+| otadata | data/ota | 0xf000 | 8 KB |
+| phy_init | data/phy | 0x11000 | 4 KB |
+| factory | app/factory | 0x20000 | 1 MB |
+| ota_0 | app/ota_0 | 0x120000 | 3 MB |
+| ota_1 | app/ota_1 | 0x420000 | 3 MB |
+| spiffs | data/spiffs | 0x720000 | 2 MB |
 
-# Trigger OTA
-curl -X POST http://<device-ip>/ota/trigger \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "http://workbench.local:8080/api/firmware/MouseKeepAlive/latest"}'
+### 10.4 BLE Command Opcodes
 
-# View UDP logs
-curl "http://workbench.local:8080/api/udplog?limit=50"
+| Opcode | Hex | Description |
+|--------|-----|-------------|
+| `CMD_OTA` | `0x10` | Start OTA; optional URL payload appended as ASCII string |
+| `CMD_WIFI_RESET` | `0x20` | Erase WiFi credentials and reboot into AP mode |
 
-# BLE scan (workbench as Windows receiver)
-curl -X POST http://workbench.local:8080/api/ble/scan \
-  -H 'Content-Type: application/json' -d '{"timeout": 5}'
-
-# Provision WiFi via workbench
-curl -X POST http://workbench.local:8080/api/wifi/provision \
-  -H 'Content-Type: application/json' \
-  -d '{"ssid": "HomeNetwork", "password": "yourpassword"}'
-
-# Erase NVS (local USB only)
-esptool.py --port <PORT> erase_region 0x9000 0x6000
-```
-
-### 10.5 Wiggle Sequence Timing Diagram
+### 10.5 HTTP Endpoint Quick Reference
 
 ```
-t=0          t=interval           t=interval+100ms
- |                |                      |
-[idle] ──────── [send +delta report] ── [send -delta report] ── [idle]
-                      ↑                        ↑
-               cursor moves right/down    cursor returns to origin
+GET  /status          → JSON: firmware, uptime, wifi_rssi, ble_connected, wiggle config
+POST /config          → Body: {"wiggle_interval_s": N, "wiggle_amplitude": N}
+POST /ota/trigger     → Body: {"url": "http://..."}
+POST /config/reset    → Factory reset (no body required)
+```
+
+### 10.6 Wiggle Sequence
+
+```
+t = 0 (interval tick)
+  → send HID report [0x00, +dx, +dy, 0x00, 0x00]
+t = +100 ms
+  → send HID report [0x00, -dx, -dy, 0x00, 0x00]
+Net cursor displacement: zero
 ```

@@ -1,0 +1,29 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "nvs_store.c"
+        "udp_log.c"
+        "wifi_prov.c"
+        "ble_nus.c"
+        "cmd_handler.c"
+        "ota_update.c"
+        "http_server.c"
+    INCLUDE_DIRS "."
+    EMBED_FILES  "portal.html"
+    PRIV_REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_http_server
+        esp_http_client
+        esp_https_ota
+        bt
+        dns_server
+        lwip
+        esp_app_format
+        app_update
+        json
+        driver
+        esp_timer
+)
